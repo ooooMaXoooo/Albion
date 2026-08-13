@@ -22,6 +22,13 @@ serveur = st.sidebar.selectbox("Serveur", ["europe", "west", "east"], index=0)
 
 # ID de l'objet (Unique Name)
 item_id = st.sidebar.text_input("Identifiant de l'objet (Item ID)", value="T4_SHOES_PLATE_SET1")
+#T4_METALBAR
+#T4_LEATHER
+#T4_CLOTH
+#T4_STONEBLOCK
+#T4_PLANKS
+
+
 
 # Sélection des villes
 villes_disponibles = ["Bridgewatch", "Fort Sterling", "Lymhurst", "Martlock", "Thetford", "Caerleon"]
