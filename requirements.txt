@@ -2,3 +2,4 @@ streamlit
 requests
 pandas
 plotly
+streamlit_antd_components
