@@ -4,26 +4,25 @@ from datetime import datetime, timedelta, timezone
 
 BASE_URL_PRICES = "https://europe.albion-online-data.com/api/v2/stats/prices"
 BASE_URL_CHARTS = "https://europe.albion-online-data.com/api/v2/stats/charts"
-HEADERS = {'User-Agent': 'AlbionRouteOptimizer/1.5'}
+
+HEADERS = {
+    'User-Agent': 'Albion-Trading-Empire-SaaS/1.0',
+    'Accept-Encoding': 'gzip, deflate'
+}
 
 def parse_api_date(date_str: str) -> datetime:
-    """Convertit la date de l'API en objet datetime UTC compréhensible par Python."""
     try:
         if not date_str or date_str.startswith("0001"):
             return datetime.min.replace(tzinfo=timezone.utc)
         
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        
-        # Si la date est "naive", on la force en UTC
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-            
         return dt
     except Exception:
         return datetime.min.replace(tzinfo=timezone.utc)
 
 def calculate_vwap_and_volume(chart_data: dict) -> Tuple[int, int]:
-    """Calcule le prix moyen et le volume sur les 3 DERNIERS JOURS uniquement."""
     if 'data' not in chart_data or not chart_data['data']:
         return 0, 0
         
@@ -41,51 +40,57 @@ def calculate_vwap_and_volume(chart_data: dict) -> Tuple[int, int]:
     return int(total_value / total_volume), total_volume
 
 def fetch_market_prices(api_item_ids: List[str], cities: List[str]) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, int]], Dict[str, Dict[str, int]]]:
-    items_str = ",".join(api_item_ids)
+    unique_ids = list(set(api_item_ids))
+    
+    buying_prices = {item_id: {} for item_id in unique_ids}
+    selling_prices = {item_id: {} for item_id in unique_ids}
+    selling_volumes = {item_id: {} for item_id in unique_ids}
+    
     locations_str = ",".join(cities)
     
-    buying_prices = {item_id: {} for item_id in api_item_ids}
-    selling_prices = {item_id: {} for item_id in api_item_ids}
-    selling_volumes = {item_id: {} for item_id in api_item_ids}
+    all_prices_data = []
+    all_charts_data = []
     
-    # --- 1. REQUÊTES API (SÉCURISÉES SUR LA QUALITÉ 1) ---
-    try:
-        # On force qualities=1 directement à la source pour éviter le bruit des objets Chef-d'œuvre
-        resp_prices = requests.get(f"{BASE_URL_PRICES}/{items_str}.json?locations={locations_str}&qualities=1", headers=HEADERS, timeout=10)
-        resp_prices.raise_for_status()
-        prices_data = resp_prices.json()
-    except Exception as e:
-        print(f"Erreur Prices API : {e}")
-        prices_data = []
+    CHUNK_SIZE = 60
+    
+    for i in range(0, len(unique_ids), CHUNK_SIZE):
+        chunk = unique_ids[i:i + CHUNK_SIZE]
+        items_str = ",".join(chunk)
+        
+        try:
+            url_prices = f"{BASE_URL_PRICES}/{items_str}.json?locations={locations_str}&qualities=1"
+            resp_prices = requests.get(url_prices, headers=HEADERS, timeout=15)
+            resp_prices.raise_for_status()
+            all_prices_data.extend(resp_prices.json())
+        except Exception as e:
+            print(f"⚠️ Erreur Prices API (Lot {i//CHUNK_SIZE + 1}) : {e}")
 
-    try:
-        resp_charts = requests.get(f"{BASE_URL_CHARTS}/{items_str}.json?locations={locations_str}&qualities=1&time-scale=24", headers=HEADERS, timeout=10)
-        resp_charts.raise_for_status()
-        charts_data = resp_charts.json()
-    except Exception as e:
-        print(f"Erreur Charts API : {e}")
-        charts_data = []
+        try:
+            url_charts = f"{BASE_URL_CHARTS}/{items_str}.json?locations={locations_str}&qualities=1&time-scale=24"
+            resp_charts = requests.get(url_charts, headers=HEADERS, timeout=15)
+            resp_charts.raise_for_status()
+            all_charts_data.extend(resp_charts.json())
+        except Exception as e:
+            print(f"⚠️ Erreur Charts API (Lot {i//CHUNK_SIZE + 1}) : {e}")
 
-    # --- 2. ANALYSE DES VOLUMES (CHARTS) ---
     chart_map = {}
-    for entry in charts_data:
+    for entry in all_charts_data:
         item = entry.get('item_id')
         loc = entry.get('location')
         quality = entry.get('quality', 1)
         
-        if quality != 1:
-            continue
+        if quality != 1: continue
             
         if item and loc:
             vwap, volume = calculate_vwap_and_volume(entry)
             chart_map[(item, loc)] = (vwap, volume)
 
-    # --- 3. CROISEMENT ET FILTRAGE DE SÉCURITÉ ---
     now = datetime.now(timezone.utc)
-    MAX_AGE_HOURS = 48  
+    
+    MAX_AGE_HOURS = 48
     MIN_VOLUME = 3      
     
-    for entry in prices_data:
+    for entry in all_prices_data:
         item = entry.get('item_id')
         loc = entry.get('city')
         quality = entry.get('quality', 1)
@@ -97,12 +102,10 @@ def fetch_market_prices(api_item_ids: List[str], cities: List[str]) -> Tuple[Dic
         date_str = entry.get('sell_price_min_date', '')
         sell_date = parse_api_date(date_str)
         
-        # Filtre de Fraîcheur
         is_fresh = (now - sell_date) <= timedelta(hours=MAX_AGE_HOURS)
         if not is_fresh:
             sell_price = 0  
             
-        # Filtre de Liquidité
         vwap, volume = chart_map.get((item, loc), (0, 0))
         is_liquid = volume >= MIN_VOLUME
         if not is_liquid:

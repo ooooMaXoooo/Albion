@@ -1,6 +1,6 @@
+import statistics
 from market_data_fetcher import fetch_market_prices
 from item_database import build_item_database, Item
-import statistics
 
 def get_bonus_city(item: Item) -> str:
     cat = item.category.lower()
@@ -11,126 +11,195 @@ def get_bonus_city(item: Item) -> str:
     if any(x in cat for x in ["mace", "naturestaff", "firestaff", "leatherarmor", "clothhelmet"]): return "Thetford"
     return "Thetford"
 
+def collect_required_api_ids(base_id: str, tier: int, enchantment: int, db: dict, api_ids_set: set):
+    full_id = f"T{tier}_{base_id}" + (f"@{enchantment}" if enchantment > 0 else "")
+    if full_id in api_ids_set: return
+    api_ids_set.add(full_id)
+    
+    if base_id not in db: return
+    item = db[base_id]
+    
+    for res_base in item.base_recipe.keys():
+        collect_required_api_ids(res_base, tier, enchantment, db, api_ids_set)
+        
+    for res_base in item.static_recipe.keys():
+        sub_ench = enchantment if res_base in db else 0
+        collect_required_api_ids(res_base, tier, sub_ench, db, api_ids_set)
+        
+    if enchantment > 0:
+        collect_required_api_ids(base_id, tier, enchantment - 1, db, api_ids_set)
+        ench_mat = item._get_enchantment_material_id(tier)
+        api_ids_set.add(f"T{tier}_{ench_mat}")
+
+# NOUVEAU : Ajout de l'argument slippage
+def get_optimal_flat_recipe(base_id: str, tier: int, enchantment: int, db: dict, buying_prices: dict, RRR_BONUS: float, STATION_FEE: int, target_base_id: str, slippage: float, depth=0):
+    if depth > 10: return 9999999, 9999999, {}, "Erreur Boucle"
+    item_full_id = f"T{tier}_{base_id}" + (f"@{enchantment}" if enchantment > 0 else "")
+    
+    # --- OPTION 1 : ACHAT DIRECT ---
+    if base_id != target_base_id:
+        options = buying_prices.get(item_full_id, {})
+        if options:
+            best_city = min(options, key=options.get)
+            # APPLICATION DU SLIPPAGE SUR LE PRIX D'ACHAT DES RESSOURCES
+            market_price = int(options[best_city] * (1.0 + slippage))
+        else:
+            best_city = "Thetford"
+            market_price = 9999999
+    else:
+        market_price = 9999999
+        best_city = "Thetford"
+        
+    best_cost = market_price
+    best_invest = market_price
+    best_recipe = {item_full_id: {'qty': 1, 'buy_city': best_city, 'unit_price': market_price}}
+    best_method = "Achat direct"
+    
+    if base_id not in db:
+        return best_cost, best_invest, best_recipe, best_method
+        
+    item = db[base_id]
+    
+    # --- OPTION 2 : FORGE À LA STATION ---
+    if item.base_recipe or item.static_recipe:
+        craft_cost, craft_invest = 0, 0
+        flat_recipe = {}
+        possible = True
+        
+        for res_base, qty in item.base_recipe.items():
+            # PASSAGE DU SLIPPAGE DANS LA RÉCURSION
+            c, inv, rec, _ = get_optimal_flat_recipe(res_base, tier, enchantment, db, buying_prices, RRR_BONUS, STATION_FEE, target_base_id, slippage, depth+1)
+            if c >= 9999999: possible = False
+            
+            eff_qty = qty * (1 - RRR_BONUS)
+            craft_cost += c * eff_qty
+            craft_invest += inv * qty
+            for k, v in rec.items():
+                if k not in flat_recipe:
+                    flat_recipe[k] = {'qty': 0, 'buy_city': v['buy_city'], 'unit_price': v['unit_price']}
+                flat_recipe[k]['qty'] += v['qty'] * qty
+                
+        for res_base, qty in item.static_recipe.items():
+            sub_ench = enchantment if res_base in db else 0 
+            c, inv, rec, _ = get_optimal_flat_recipe(res_base, tier, sub_ench, db, buying_prices, RRR_BONUS, STATION_FEE, target_base_id, slippage, depth+1)
+            if c >= 9999999: possible = False
+            
+            craft_cost += c * qty
+            craft_invest += inv * qty
+            for k, v in rec.items():
+                if k not in flat_recipe:
+                    flat_recipe[k] = {'qty': 0, 'buy_city': v['buy_city'], 'unit_price': v['unit_price']}
+                flat_recipe[k]['qty'] += v['qty'] * qty
+                
+        if possible:
+            total_cost = craft_cost + STATION_FEE
+            total_invest = craft_invest + STATION_FEE
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_invest = total_invest
+                best_recipe = flat_recipe
+                best_method = "Forge"
+
+    # --- OPTION 3 : ENCHANTEMENT ---
+    if enchantment > 0:
+        prev_c, prev_inv, prev_rec, _ = get_optimal_flat_recipe(base_id, tier, enchantment - 1, db, buying_prices, RRR_BONUS, STATION_FEE, target_base_id, slippage, depth+1)
+        ench_mat = item._get_enchantment_material_id(tier)
+        ench_qty = item.get_enchantment_cost()
+        
+        if ench_qty > 0:
+            mat_c, mat_inv, mat_rec, _ = get_optimal_flat_recipe(ench_mat, tier, 0, db, buying_prices, RRR_BONUS, STATION_FEE, target_base_id, slippage, depth+1)
+            
+            total_cost = prev_c + (mat_c * ench_qty)
+            total_invest = prev_inv + (mat_inv * ench_qty)
+            
+            if prev_c < 9999999 and mat_c < 9999999 and total_cost < best_cost:
+                best_cost = total_cost
+                best_invest = total_invest
+                
+                flat_recipe = {k: {'qty': v['qty'], 'buy_city': v['buy_city'], 'unit_price': v['unit_price']} for k, v in prev_rec.items()}
+                for k, v in mat_rec.items():
+                    if k not in flat_recipe:
+                        flat_recipe[k] = {'qty': 0, 'buy_city': v['buy_city'], 'unit_price': v['unit_price']}
+                    flat_recipe[k]['qty'] += v['qty'] * ench_qty
+                    
+                best_recipe = flat_recipe
+                best_method = f"Forge (.0) + Enchantement (.{enchantment})"
+                
+    return best_cost, best_invest, best_recipe, best_method
+
 def analyze_crafting_profitability(
-    target_base_ids: list,
+    target_pool: list, 
     has_premium: bool = False,
     target_market_share: float = 0.10,
     station_fee_estimate: int = 1000,
-    target_tier: int = 4, 
-    target_enchantment: int = 1
+    lang: str = "fr",
+    slippage: float = 0.10 # NOUVEAU: Par défaut 10%
 ):
     db = build_item_database()
     cities = ['Thetford', 'Fort Sterling', 'Lymhurst', 'Bridgewatch', 'Martlock']
     
-    # On récupère uniquement les objets demandés qui existent dans la base
-    target_items = [db[b_id] for b_id in target_base_ids if b_id in db]
-
-    # --- PARAMÈTRES ÉCONOMIQUES DYNAMIQUES ---
     RRR_BONUS = 0.248
     MARKET_TAX = 0.065 if has_premium else 0.105 
 
-    print(f"\nPréparation de l'analyse pour le Tier {target_tier}.{target_enchantment}...")
     api_ids_to_fetch = set()
-    
-    for item in target_items:
-        api_ids_to_fetch.add(item.get_id(target_tier, target_enchantment))
-        for method, recipe in item.get_recipes(target_tier, target_enchantment).items():
-            for res_id in recipe.keys():
-                api_ids_to_fetch.add(res_id)
+    for target in target_pool:
+        if target['base_id'] in db:
+            collect_required_api_ids(target['base_id'], target['tier'], target['enchantment'], db, api_ids_to_fetch)
 
-    print(f"Interrogation de l'API pour {len(api_ids_to_fetch)} objets de marché...")
     buying_prices, selling_prices, selling_volumes = fetch_market_prices(list(api_ids_to_fetch), cities)
 
     profitable_items = []
-    print("\n==========================================")
-    print("ANALYSE DES MARGES DE CRAFT")
-    print("==========================================")
     
-    for item in target_items:
-        item_id = item.get_id(target_tier, target_enchantment)
+    for target in target_pool:
+        base_id = target['base_id']
+        if base_id not in db: continue
+        
+        tier = target['tier']
+        enchantment = target['enchantment']
+        item = db[base_id]
+        
+        item_id = item.get_id(tier, enchantment)
         
         sell_options = selling_prices.get(item_id, {})
-        if not sell_options:
-            continue
+        if not sell_options: continue
             
-        # Filtre anti-manipulation (Médiane)
         if len(sell_options) >= 3:
             med_price = statistics.median(sell_options.values())
-            valid_sells = {city: p for city, p in sell_options.items() if p <= med_price * 1.5}
-            if not valid_sells: 
-                valid_sells = sell_options
+            valid_sells = {c: p for c, p in sell_options.items() if p <= med_price * 1.5}
+            if not valid_sells: valid_sells = sell_options
         else:
             valid_sells = sell_options
             
         best_sell_city = max(valid_sells, key=valid_sells.get)
-        sell_price = valid_sells[best_sell_city]
+        # APPLICATION DU SLIPPAGE SUR LE PRIX DE VENTE (on gagne moins que prévu)
+        sell_price = int(valid_sells[best_sell_city] * (1.0 - slippage))
         
-        # Calcul de la quantité basée sur la part de marché ciblée
-        daily_volume = selling_volumes.get(item_id, {}).get(best_sell_city, 1)
-        target_qty = int(daily_volume * target_market_share)
-        target_qty = max(1, min(target_qty, 30)) # On limite entre 1 et 30 par défaut
+        daily_vol = selling_volumes.get(item_id, {}).get(best_sell_city, 1)
+        target_qty = max(1, min(int(daily_vol * target_market_share), 30))
         
         best_craft_city = get_bonus_city(item)
 
-        best_net_profit = -999999
-        best_method = ""
-        best_cost = 0
-        
-        for method, recipe in item.get_recipes(target_tier, target_enchantment).items():
-            base_materials_cost = 0
-            enchant_materials_cost = 0
-            missing_resource = False
-            
-            for res_id, qty in recipe.items():
-                res_options = buying_prices.get(res_id, {})
-                if not res_options:
-                    missing_resource = True
-                    break
-                
-                best_buy_price = min(res_options.values())
-                
-                if any(x in res_id for x in ["RUNE", "SOUL", "RELIC", "SHARD_AVALONIAN"]):
-                    enchant_materials_cost += (qty * best_buy_price)
-                else:
-                    base_materials_cost += (qty * best_buy_price)
+        # On transmet le slippage pour impacter le prix d'achat des ressources
+        best_cost, best_invest, flat_recipe, method = get_optimal_flat_recipe(
+            base_id, tier, enchantment, db, buying_prices, RRR_BONUS, station_fee_estimate, target_base_id=base_id, slippage=slippage
+        )
 
-            if missing_resource:
-                continue
+        if best_cost >= 9999999: continue
 
-            effective_cost = (base_materials_cost * (1 - RRR_BONUS)) + enchant_materials_cost
-            market_tax_cost = sell_price * MARKET_TAX
-            total_cost = effective_cost + market_tax_cost + station_fee_estimate
-            net_profit = sell_price - total_cost
-            
-            if net_profit > best_net_profit:
-                best_net_profit = net_profit
-                best_method = method
-                best_cost = total_cost
+        market_tax_cost = sell_price * MARKET_TAX
+        net_profit = sell_price - best_cost - market_tax_cost
+        upfront_investment = best_invest + (sell_price * 0.025)
 
-        if best_net_profit == -999999:
-            continue
-            
-        status = "✅ RENTABLE" if best_net_profit > 0 else "❌ PERTE"
-        method_str = "Forge (Matériaux .1)" if best_method == "craft_station" else "Forge (.0) + Runes"
-        
-        name_fr = item.get_name(target_tier, "fr")
-        name_en = item.get_name(target_tier, "en")
-        print(f"\n{status} : {name_fr.upper()} ({name_en})")
-        print(f"  Méthode optimale: {method_str}")
-        print(f"  Ville de Craft  : {best_craft_city} (RRR: {RRR_BONUS*100:.1f}%)")
-        print(f"  Ville de Vente  : {best_sell_city} à {sell_price:,} Silver (Vol: {daily_volume}/j)")
-        print(f"  Quantité Cible  : {target_qty} unités (Part de marché: {target_market_share*100}%)")
-        print(f"  Coût total estimé : {int(best_cost):,} Silver")
-        print(f"  Marge Nette     : {int(best_net_profit):,} Silver par unité")
-
-        if best_net_profit > 0:
+        if net_profit > 0:
             profitable_items.append({
-                'base_id': item.base_id,
-                'name_fr': name_fr,
-                'name_en': name_en,
+                'item_id': item_id,
+                'name_display': f"{item.get_name(tier, lang)} ({item_id})",
                 'quantity': target_qty,
-                'profit': int(best_net_profit),
-                'method': best_method,
+                'profit': int(net_profit),
+                'upfront_cost': int(upfront_investment),
+                'sell_price': int(sell_price), 
+                'method': method,
+                'flat_recipe': flat_recipe,
                 'craft_city': best_craft_city,
                 'sell_city': best_sell_city
             })

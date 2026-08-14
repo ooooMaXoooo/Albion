@@ -22,19 +22,25 @@ class ItemSlot(str, Enum):
 
 @dataclass(eq=False)
 class Item:
-    internal_name: str    
-    base_id: str   
-    mass_kg: float
-    category: str         
+    internal_name: str
+    base_id: str
+    category: str
     slot: ItemSlot
-    base_recipe: Dict[str, int] = field(default_factory=dict)
-    base_artifact: str = "" 
+    main_category: str = ""
     
-    # Dictionnaire des noms trié par Tier. Ex: {4: {"fr": "Épée...", "en": "Sword..."}}
+    base_recipe: Dict[str, int] = field(default_factory=dict)
+    static_recipe: Dict[str, int] = field(default_factory=dict)
+    
+    # NOUVEAU : Dictionnaire pour stocker les masses par Tier
+    masses_kg: Dict[int, float] = field(default_factory=dict)
+    
     localized_names: Dict[int, Dict[str, str]] = field(default_factory=dict)
     
+    def get_mass(self, tier: int) -> float:
+        """Retourne la masse exacte de l'objet selon son Tier."""
+        return self.masses_kg.get(tier, 1.0)
+    
     def get_name(self, tier: int, lang: str = "fr") -> str:
-        """Récupère le nom correct selon le Tier (Adept's, Expert's, etc.)"""
         names = self.localized_names.get(tier, {})
         return names.get(lang, f"T{tier} {self.internal_name}")
     
@@ -52,7 +58,6 @@ class Item:
         return "RUNE"
 
     def get_enchantment_cost(self) -> int:
-        """Coût exact des runes basé sur l'emplacement de l'objet (Slot)."""
         cost_map = {
             ItemSlot.HEAD: 96,
             ItemSlot.SHOES: 96,
@@ -65,10 +70,9 @@ class Item:
 
     def get_recipes(self, tier: int, enchantment: int = 0) -> Dict[str, Dict[str, int]]:
         recipes = {}
-        if not self.base_recipe:
+        if not self.base_recipe and not self.static_recipe:
             return recipes
 
-        # Méthode 1: Forge avec des matériaux déjà enchantés (.1, .2)
         craft_mats = {}
         for res_base_id, qty in self.base_recipe.items():
             res_id = f"T{tier}_{res_base_id}"
@@ -76,25 +80,23 @@ class Item:
                 res_id += f"@{enchantment}"
             craft_mats[res_id] = qty
             
-        if self.base_artifact:
-            craft_mats[f"T{tier}_{self.base_artifact}"] = 1
+        for static_id, qty in self.static_recipe.items():
+            craft_mats[static_id] = qty
             
         recipes["craft_station"] = craft_mats
 
-        # Méthode 2: Forge avec des matériaux basiques (.0) PUIS Manipulateur d'énergie
-        if enchantment > 0:
+        if enchantment > 0 and self.base_recipe:
             ench_recipe = {}
-            # Ajout des ressources de base (.0)
             for res_base_id, qty in self.base_recipe.items():
                 ench_recipe[f"T{tier}_{res_base_id}"] = qty
                 
-            if self.base_artifact:
-                ench_recipe[f"T{tier}_{self.base_artifact}"] = 1
+            for static_id, qty in self.static_recipe.items():
+                ench_recipe[static_id] = qty
                 
-            # Ajout des runes
             ench_mat = self._get_enchantment_material_id(tier)
             ench_qty = self.get_enchantment_cost()
-            ench_recipe[f"T{tier}_{ench_mat}"] = ench_qty
+            if ench_qty > 0:
+                ench_recipe[f"T{tier}_{ench_mat}"] = ench_qty
             
             recipes["energy_manipulator"] = ench_recipe
 
@@ -143,9 +145,6 @@ def build_item_database() -> Dict[str, Item]:
     
     database: Dict[str, Item] = {}
     
-    # ------------------------------------------------
-    # ÉTAPE A : Extraire la physique depuis l'XML
-    # ------------------------------------------------
     tree = ET.parse(XML_FILE)
     root = tree.getroot()
     
@@ -160,9 +159,6 @@ def build_item_database() -> Dict[str, Item]:
             
         tier = int(match.group(1))
         base_id = match.group(2)
-        
-        if tier != 4:
-            continue
 
         shop_category = element.get("shopcategory", "").lower()
         subcategory = element.get("shopsubcategory1", "").lower()
@@ -176,44 +172,42 @@ def build_item_database() -> Dict[str, Item]:
         if slot == ItemSlot.UNKNOWN:
             continue
             
-        internal_name = base_id.split("_")[-1].title()
-        
-        base_recipe = {}
-        base_artifact = ""
-        
-        craft_reqs = element.findall("craftingrequirements")
-        if craft_reqs:
-            for res in craft_reqs[0].findall("craftresource"):
-                res_uniquename = res.get("uniquename", "")
-                res_count = int(res.get("count", "0"))
-                
-                res_match = re.match(r"^T\d+_([A-Z0-9_]+)$", res_uniquename)
-                if res_match:
-                    res_base_id = res_match.group(1)
-                    if "ARTEFACT" in res_base_id:
-                        base_artifact = res_base_id
+        if base_id not in database:
+            internal_name = base_id.split("_")[-1].title()
+            base_recipe = {}
+            static_recipe = {}
+            
+            craft_reqs = element.findall("craftingrequirements")
+            if craft_reqs:
+                for res in craft_reqs[0].findall("craftresource"):
+                    res_uniquename = res.get("uniquename", "")
+                    res_count = int(res.get("count", "0"))
+                    
+                    res_match = re.match(r"^T\d+_(PLANKS|LEATHER|METALBAR|CLOTH)$", res_uniquename)
+                    if res_match:
+                        base_recipe[res_match.group(1)] = res_count
                     else:
-                        base_recipe[res_base_id] = res_count
+                        static_recipe[res_uniquename] = res_count
 
-        database[base_id] = Item(
-            internal_name=internal_name,
-            base_id=base_id,
-            mass_kg=weight,
-            category=subcategory,
-            slot=slot,
-            base_recipe=base_recipe,
-            base_artifact=base_artifact
-        )
+            # L'indentation de cette création est très importante !
+            database[base_id] = Item(
+                internal_name=internal_name,
+                base_id=base_id,
+                category=subcategory,
+                main_category=shop_category,
+                slot=slot,
+                base_recipe=base_recipe,
+                static_recipe=static_recipe
+            )
+            
+        # NOUVEAU : On ajoute le poids spécifique au Tier actuel
+        database[base_id].masses_kg[tier] = weight
         
-    # ------------------------------------------------
-    # ÉTAPE B : Appliquer les noms depuis le JSON
-    # ------------------------------------------------
     with open(NAMES_FILE, 'r', encoding='utf-8') as f:
         names_data = json.load(f)
         
     for item_info in names_data:
         uniquename = item_info.get("UniqueName", "")
-        # On ignore les versions pré-enchantées (@1, @2) pour avoir le nom générique
         if not uniquename or "@" in uniquename:
             continue
             
@@ -238,17 +232,3 @@ def build_item_database() -> Dict[str, Item]:
                         database[base_id].localized_names[tier]["en"] = lang_val
 
     return database
-
-if __name__ == "__main__":
-    db = build_item_database()
-    
-    if len(db) > 0:
-        print("\n--- TEST: DUAL SWORD T4.1 ---")
-        sword = db.get("2H_DUALSWORD")
-        if sword:
-            # On teste la nouvelle fonction de récupération du nom !
-            print(f"Nom Français (T4) : {sword.get_name(4, 'fr')}")
-            print(f"Nom Anglais (T4)  : {sword.get_name(4, 'en')}")
-            print(f"ID API            : {sword.get_id(tier=4, enchantment=1)}")
-            print(f"Masse             : {sword.mass_kg} kg")
-            print(f"Coût Runes        : {sword.get_enchantment_cost()} Runes")
